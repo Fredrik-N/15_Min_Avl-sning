@@ -55,6 +55,8 @@ CONFIG_CMP = {
     # The same comparison for each season (on top of the whole period).
     # None = the seasons lpc_8 uses for its temperature correlation
     # (CONFIG["temp_corr_season_months"]: winter 11,12,1,2; summer 5,6,7,8).
+    # Also accepted: "winter, summer" (by name), False (whole period only),
+    # or your own months: {"winter": [12, 1, 2], "summer": [6, 7, 8]}.
     "seasons": None,
     # "own":  each season gets its own constraint window, derived from the
     #         grid's load in that season only (the grid's peak hours move
@@ -244,6 +246,52 @@ def plot(frame, sites, constraint_hours, path, show, title=""):
     plt.close(fig)
 
 
+DEFAULT_SEASONS = {"winter": [11, 12, 1, 2], "summer": [5, 6, 7, 8]}
+
+
+def resolve_seasons(cmp, cfg):
+    """
+    CONFIG_CMP["seasons"] as {name: [months]}. Accepts:
+      None / True        -> lpc_8's CONFIG["temp_corr_season_months"]
+                            (winter 11,12,1,2; summer 5,6,7,8)
+      False / "" / {}    -> no seasons, whole period only
+      "winter, summer"   -> those seasons by name (text or a list of names)
+      {"winter": [12, 1, 2], ...}  -> exactly these months
+    """
+    known = cfg.get("temp_corr_season_months")
+    if not isinstance(known, dict) or not known:
+        known = DEFAULT_SEASONS
+    known = {str(k).strip().lower(): v for k, v in known.items()}
+    for k, v in DEFAULT_SEASONS.items():
+        known.setdefault(k, v)
+    s = cmp.get("seasons")
+    if s is None or s is True:
+        return dict(known)
+    if s is False or (isinstance(s, (str, dict, list, tuple)) and not s):
+        return {}
+    if isinstance(s, str):
+        s = [x for x in s.replace(";", ",").replace("/", ",").split(",")]
+    if isinstance(s, (list, tuple)):
+        out = {}
+        for name in s:
+            key = str(name).strip().lower()
+            if key not in known:
+                raise ValueError(f"Unknown season {name!r} in CONFIG_CMP['seasons']. Known: "
+                                 f"{list(known)} -- or give months, e.g. {{'winter': [12, 1, 2]}}.")
+            out[key] = known[key]
+        return out
+    if isinstance(s, dict):
+        out = {}
+        for name, months in s.items():
+            ms = [months] if isinstance(months, int) else list(months)
+            if not ms or not all(isinstance(m, int) and 1 <= m <= 12 for m in ms):
+                raise ValueError(f"CONFIG_CMP['seasons'][{name!r}] must be month numbers 1-12, got {months!r}.")
+            out[str(name)] = ms
+        return out
+    raise ValueError(f"CONFIG_CMP['seasons'] = {s!r} not understood -- use None, 'winter, summer', "
+                     f"or {{'winter': [11, 12, 1, 2], 'summer': [5, 6, 7, 8]}}.")
+
+
 def main(cfg=L.CONFIG, cmp=CONFIG_CMP):
     gpath = cfg.get("grid_consumption", {}).get("csv_path")
     if not gpath or not os.path.exists(gpath):
@@ -258,7 +306,7 @@ def main(cfg=L.CONFIG, cmp=CONFIG_CMP):
     base = os.path.join(folder, cmp["output_prefix"])
     sep, dec = cfg.get("results_csv_sep", ";"), cfg.get("results_csv_decimal", ",")
 
-    seasons = cmp.get("seasons") or cfg.get("temp_corr_season_months") or {}
+    seasons = resolve_seasons(cmp, cfg)
     periods = [("all", None)] + list(seasons.items())
     summaries, overview, files = [], [], []
     for name, months in periods:
