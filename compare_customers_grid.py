@@ -18,10 +18,16 @@ Questions answered:
     hour-of-day profiles, load in the constraint window)?
   - Which customer contributes most when the grid is constrained?
 
+Everything is done for the whole period and again for each season
+(winter / summer, CONFIG_CMP["seasons"]); by default each season gets its
+own constraint window from the grid's load in that season.
+
 Outputs (next to the comparison file, prefix CONFIG_CMP["output_prefix"]):
-  <prefix>_summary.csv      one row per customer + a TOTAL row
+  <prefix>_summary.csv      one row per customer + a TOTAL row, per season
+                            (column "season": all / winter / summer)
   <prefix>_timeseries.csv   15-min: grid, customers total, each customer
-  <prefix>.png              four panels (see plot())
+  <prefix>.png              four panels for the whole period (see plot())
+  <prefix>_winter.png, <prefix>_summer.png   the same per season
 
 Run:  python compare_customers_grid.py
 """
@@ -46,6 +52,15 @@ CONFIG_CMP = {
     "output_prefix": "customers_vs_grid",
     "write_timeseries": True,
     "show_plot": True,
+    # The same comparison for each season (on top of the whole period).
+    # None = the seasons lpc_8 uses for its temperature correlation
+    # (CONFIG["temp_corr_season_months"]: winter 11,12,1,2; summer 5,6,7,8).
+    "seasons": None,
+    # "own":  each season gets its own constraint window, derived from the
+    #         grid's load in that season only (the grid's peak hours move
+    #         between winter and summer).
+    # "year": every season is scored against the whole-period window.
+    "season_constraint_window": "own",
 }
 
 
@@ -157,21 +172,31 @@ def _shade(ax, hours, alpha):
             start = prev = h
 
 
-def plot(frame, sites, constraint_hours, path, show):
+def plot(frame, sites, constraint_hours, path, show, title=""):
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    if title:
+        fig.suptitle(title, fontsize=14)
     grid, total = frame["grid_kw"], frame["customers_total_kw"]
 
     # 1. daily mean, two axes
     ax = axes[0, 0]
-    d = frame[["grid_kw", "customers_total_kw"]].resample("D").mean()
-    ax.plot(d.index, d["grid_kw"], color="black", label="Grid")
+    # days with data only, side by side: a season that spans the new year
+    # (Nov-Feb) is drawn without an empty spring/summer in the middle
+    d = frame[["grid_kw", "customers_total_kw"]].resample("D").mean().dropna(how="all")
+    x = np.arange(len(d))
+    ax.plot(x, d["grid_kw"].to_numpy(), color="black", label="Grid")
     ax.set_ylabel("Grid, daily mean (kW)")
     ax2 = ax.twinx()
-    ax2.plot(d.index, d["customers_total_kw"], color="tab:blue", label="Customers total")
+    ax2.plot(x, d["customers_total_kw"].to_numpy(), color="tab:blue", label="Customers total")
     ax2.set_ylabel("Customers total, daily mean (kW)", color="tab:blue")
-    ax.set_title("Daily mean load")
+    ticks = np.unique(np.linspace(0, len(d) - 1, min(len(d), 7)).astype(int))
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([d.index[i].strftime("%Y-%m-%d") for i in ticks], rotation=30)
+    jumps = np.flatnonzero(np.diff(d.index.to_numpy()).astype("timedelta64[D]").astype(int) > 1)
+    for j in jumps:                      # mark where days are skipped
+        ax.axvline(j + 0.5, color="grey", linestyle=":", linewidth=1)
+    ax.set_title("Daily mean load (dotted line = days skipped)" if len(jumps) else "Daily mean load")
     ax.grid(True, alpha=0.3)
-    ax.tick_params(axis="x", rotation=30)
 
     # 2. hour-of-day shape, each relative to its own mean, weekdays
     ax = axes[0, 1]
@@ -225,36 +250,63 @@ def main(cfg=L.CONFIG, cmp=CONFIG_CMP):
         raise FileNotFoundError(f"Grid file {gpath!r} not found -- set CONFIG['grid_consumption']['csv_path'] in lpc_8.py.")
     series = load_customers(cfg)
     grid = L.load_grid_consumption(cfg)
-    constraint_hours, _ = L.derive_constraint_window_hours(grid, cfg)
     frame = combine(series, grid, cmp)
     sites = list(series)
-    summary = summarise(frame, sites, constraint_hours, cmp, cfg)
+    year_hours, _ = L.derive_constraint_window_hours(grid, cfg)
 
     folder = os.path.dirname(os.path.abspath(cfg["results_csv_path"]))
     base = os.path.join(folder, cmp["output_prefix"])
     sep, dec = cfg.get("results_csv_sep", ";"), cfg.get("results_csv_decimal", ",")
+
+    seasons = cmp.get("seasons") or cfg.get("temp_corr_season_months") or {}
+    periods = [("all", None)] + list(seasons.items())
+    summaries, overview, files = [], [], []
+    for name, months in periods:
+        f = frame if months is None else frame[frame.index.month.isin(months)]
+        if f.empty:
+            print(f"\n[customers vs grid] {name}: no shared data in months {months} -- skipped")
+            continue
+        if months is not None and cmp.get("season_constraint_window", "own") == "own":
+            print(f"\n[{name}]", end="")
+            hours, _ = L.derive_constraint_window_hours(grid[grid.index.month.isin(months)], cfg)
+        else:
+            hours = year_hours
+        sm = summarise(f, sites, hours, cmp, cfg)
+        sm.insert(0, "season", name)
+        sm.insert(1, "constraint_hours", ",".join(str(h) for h in hours))
+        summaries.append(sm)
+        png = f"{base}.png" if months is None else f"{base}_{name}.png"
+        label = "whole period" if months is None else f"{name} (months {', '.join(str(m) for m in months)})"
+        plot(f, sites, hours, png, cmp["show_plot"], title=f"Customers vs grid -- {label}")
+        files.append(png)
+        t = sm.iloc[0]
+        overview.append({"season": name, "constraint hours": f"{min(hours)}-{max(hours)}" if hours else "-",
+                         "share of grid energy": f"{t['share_of_grid_energy']:.2%}",
+                         "share at grid peak": f"{t['share_of_grid_at_grid_peak']:.2%}",
+                         "share in window": f"{t['share_of_grid_in_constraint_window']:.2%}",
+                         "window avg / avg": f"{t['window_avg_over_overall_avg']:.2f}",
+                         "coincidence": f"{t['coincidence_with_grid_peak']:.2f}",
+                         "corr (hourly)": f"{t['corr_with_grid_hourly']:+.2f}"})
+
+    summary = pd.concat(summaries, ignore_index=True)
     summary.to_csv(f"{base}_summary.csv", sep=sep, decimal=dec, index=False, encoding="utf-8-sig")
     if cmp["write_timeseries"]:
         frame.to_csv(f"{base}_timeseries.csv", sep=sep, decimal=dec, encoding="utf-8-sig",
                      index_label="timestamp", float_format="%.3f")
-    plot(frame, sites, constraint_hours, f"{base}.png", cmp["show_plot"])
 
-    t = summary.iloc[0]
+    t = summaries[0].iloc[0]
     print(f"\n[customers vs grid] {len(sites)} customer(s), {t['period_start']} .. {t['period_end']} "
           f"({cmp['period']} period, {t['quarter_hours']} quarter-hours)")
-    print(f"  share of grid energy:               {t['share_of_grid_energy']:.2%}")
-    print(f"  share of grid at the grid's peak:   {t['share_of_grid_at_grid_peak']:.2%}  "
-          f"({t['kw_at_grid_peak']:.0f} kW of the customers' {t['peak_kw']:.0f} kW peak)")
-    print(f"  share of grid in constraint window: {t['share_of_grid_in_constraint_window']:.2%}  "
-          f"(hours {constraint_hours})")
-    print(f"  customers' window avg / overall avg: {t['window_avg_over_overall_avg']:.2f}")
-    print(f"  correlation with grid (hourly):     {t['corr_with_grid_hourly']:+.2f}")
-    print("\n  per customer, largest in the constraint window first:")
+    print("\n  all customers together, per season:")
+    print(pd.DataFrame(overview).to_string(index=False))
     cols = [L.SITE_KEY, "avg_kw_in_constraint_window", "share_of_customers_in_constraint_window",
             "window_avg_over_overall_avg", "coincidence_with_grid_peak", "corr_with_grid_hourly"]
-    print(summary.iloc[1:][cols].to_string(index=False))
+    for sm in summaries:
+        print(f"\n  per customer, {sm['season'].iloc[0]} (constraint hours {sm['constraint_hours'].iloc[0]}), "
+              f"largest in the window first:")
+        print(sm.iloc[1:][cols].to_string(index=False))
     print(f"\n  wrote {base}_summary.csv" + (f", {base}_timeseries.csv" if cmp["write_timeseries"] else "")
-          + f", {base}.png")
+          + ", " + ", ".join(files))
     return summary, frame
 
 
