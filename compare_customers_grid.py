@@ -1,0 +1,262 @@
+"""
+Compare the combined load of every customer in the site comparison file
+with Öresundskraft's grid load.
+
+Uses lpc_8.py (same folder) for everything it reads, so the settings are
+the same as for the per-site analysis:
+  - the customers are the rows of CONFIG["results_csv_path"]
+    (site_comparison.csv); each one's meter file is found the same way as
+    `lpc_8.py --rerun-all` finds it (stored path, else CONFIG["meter_folder"]);
+  - the grid load is CONFIG["grid_consumption"] (hourly Netto_kWh held
+    constant over each quarter-hour), and the constraint window is
+    derived from it exactly as in lpc_8.
+
+Questions answered:
+  - How big are these customers together compared with the grid
+    (energy share, share at the grid's peak)?
+  - Do they peak when the grid peaks (coincidence, correlation,
+    hour-of-day profiles, load in the constraint window)?
+  - Which customer contributes most when the grid is constrained?
+
+Outputs (next to the comparison file, prefix CONFIG_CMP["output_prefix"]):
+  <prefix>_summary.csv      one row per customer + a TOTAL row
+  <prefix>_timeseries.csv   15-min: grid, customers total, each customer
+  <prefix>.png              four panels (see plot())
+
+Run:  python compare_customers_grid.py
+"""
+import copy
+import os
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import lpc_8 as L
+
+CONFIG_CMP = {
+    # "common": only quarter-hours where EVERY customer has data -- the
+    #           total is then a true total. Use when the files cover the
+    #           same period.
+    # "all":    every quarter-hour where at least one customer has data;
+    #           the total then sums whoever reported (n_customers_reporting
+    #           in the time series says how many).
+    "period": "common",
+    "grid_peak_top_share": 0.01,     # "grid peak" = the grid's top 1 % quarter-hours
+    "output_prefix": "customers_vs_grid",
+    "write_timeseries": True,
+    "show_plot": True,
+}
+
+
+def load_customers(cfg):
+    """{site_id: 15-min kW series} for every site in the comparison file
+    whose meter file can be found; prints the ones that cannot."""
+    df = L.read_comparison(cfg)
+    if df is None:
+        raise FileNotFoundError(f"No comparison file at {cfg.get('results_csv_path')!r}. "
+                                f"Run lpc_8.py on your sites first.")
+    series, missing = {}, []
+    for _, row in df.iterrows():
+        sid = str(row[L.SITE_KEY])
+        path = L.find_meter_file(row, cfg)
+        if path is None:
+            missing.append(sid)
+            continue
+        c = copy.deepcopy(cfg)
+        c["csv_path"] = path
+        print(f"[customers] loading {sid}")
+        series[sid] = L.load_series(c)
+    if missing:
+        print(f"[customers] meter file not found, left out: {missing} "
+              f"(set CONFIG['meter_folder'] in lpc_8.py)")
+    if not series:
+        raise ValueError("No customer meter files could be loaded.")
+    return series
+
+
+def combine(series, grid, cmp):
+    """One frame on the 15-min grid: each customer, their total, the grid."""
+    sites = pd.concat(series, axis=1)
+    n_rep = sites.notna().sum(axis=1)
+    if cmp["period"] == "common":
+        keep = n_rep == sites.shape[1]
+    else:
+        keep = n_rep > 0
+    sites = sites[keep]
+    frame = sites.copy()
+    frame["customers_total_kw"] = sites.sum(axis=1, min_count=1)
+    frame["n_customers_reporting"] = n_rep[keep]
+    frame["grid_kw"] = grid.reindex(frame.index)
+    frame = frame[frame["grid_kw"].notna()]
+    if frame.empty:
+        raise ValueError(
+            "Customers and grid share no quarter-hours. Check that the grid file covers "
+            "the same dates" + (", or use period='all'" if cmp["period"] == "common" else "")
+            + " (and that both use the same time zone convention).")
+    return frame
+
+
+def _corr(a, b):
+    ok = a.notna() & b.notna()
+    return float(np.corrcoef(a[ok], b[ok])[0, 1]) if ok.sum() > 2 and a[ok].std() > 0 and b[ok].std() > 0 else np.nan
+
+
+def summarise(frame, sites, constraint_hours, cmp, cfg):
+    """Per-customer rows plus a TOTAL row."""
+    h = pd.Timedelta(cfg["resample_freq"]).total_seconds() / 3600.0
+    grid = frame["grid_kw"]
+    in_win = frame.index.hour.isin(constraint_hours)
+    top = grid >= grid.quantile(1 - cmp["grid_peak_top_share"])
+    t_peak = grid.idxmax()
+    grid_e = grid.sum() * h
+    total = frame["customers_total_kw"]
+    rows = []
+    for name in sites + ["customers_total_kw"]:
+        x = frame[name]
+        e = x.sum() * h
+        hourly = pd.DataFrame({"x": x, "g": grid}).resample("h").mean()
+        rows.append({
+            L.SITE_KEY: "TOTAL (all customers)" if name == "customers_total_kw" else name,
+            "period_start": str(frame.index.min()), "period_end": str(frame.index.max()),
+            "quarter_hours": int(x.notna().sum()),
+            "energy_kwh": round(e, 0),
+            "share_of_customers_energy": round(e / (total.sum() * h), 4),
+            "share_of_grid_energy": round(e / grid_e, 5),
+            "avg_kw": round(x.mean(), 2),
+            "peak_kw": round(x.max(), 2),
+            "kw_at_grid_peak": round(float(x.loc[t_peak]), 2) if pd.notna(x.loc[t_peak]) else np.nan,
+            "share_of_grid_at_grid_peak": round(float(x.loc[t_peak] / grid.loc[t_peak]), 5),
+            # how much of its own peak the customer draws when the grid is at its top 1 %
+            "avg_kw_in_grid_top_hours": round(x[top].mean(), 2),
+            "coincidence_with_grid_peak": round(x[top].mean() / x.max(), 3) if x.max() > 0 else np.nan,
+            "avg_kw_in_constraint_window": round(x[in_win].mean(), 2),
+            "avg_kw_outside_constraint_window": round(x[~in_win].mean(), 2),
+            "window_avg_over_overall_avg": round(x[in_win].mean() / x.mean(), 3) if x.mean() > 0 else np.nan,
+            "share_of_customers_in_constraint_window": round(x[in_win].mean() / total[in_win].mean(), 4),
+            "share_of_grid_in_constraint_window": round(x[in_win].mean() / grid[in_win].mean(), 5),
+            "corr_with_grid_15min": round(_corr(x, grid), 3),
+            "corr_with_grid_hourly": round(_corr(hourly["x"], hourly["g"]), 3),
+        })
+    out = pd.DataFrame(rows)
+    order = out.iloc[:-1].sort_values("avg_kw_in_constraint_window", ascending=False)
+    return pd.concat([out.iloc[[-1]], order], ignore_index=True)
+
+
+def _shade(ax, hours, alpha):
+    """One band per run of consecutive constraint hours."""
+    hs = sorted(hours)
+    start = prev = None
+    for h in hs + [None]:
+        if start is None:
+            start = prev = h
+        elif h is not None and h == prev + 1:
+            prev = h
+        else:
+            ax.axvspan(start - 0.5, prev + 0.5, color="tab:red", alpha=alpha, linewidth=0)
+            start = prev = h
+
+
+def plot(frame, sites, constraint_hours, path, show):
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    grid, total = frame["grid_kw"], frame["customers_total_kw"]
+
+    # 1. daily mean, two axes
+    ax = axes[0, 0]
+    d = frame[["grid_kw", "customers_total_kw"]].resample("D").mean()
+    ax.plot(d.index, d["grid_kw"], color="black", label="Grid")
+    ax.set_ylabel("Grid, daily mean (kW)")
+    ax2 = ax.twinx()
+    ax2.plot(d.index, d["customers_total_kw"], color="tab:blue", label="Customers total")
+    ax2.set_ylabel("Customers total, daily mean (kW)", color="tab:blue")
+    ax.set_title("Daily mean load")
+    ax.grid(True, alpha=0.3)
+    ax.tick_params(axis="x", rotation=30)
+
+    # 2. hour-of-day shape, each relative to its own mean, weekdays
+    ax = axes[0, 1]
+    wd = frame[frame.index.dayofweek < 5]
+    for col, lab, colr in (("grid_kw", "Grid", "black"), ("customers_total_kw", "Customers total", "tab:blue")):
+        prof = wd[col].groupby(wd.index.hour).mean()
+        ax.plot(prof.index, prof / wd[col].mean(), color=colr, linewidth=2, label=lab)
+    _shade(ax, constraint_hours, 0.08)
+    ax.axhline(1, color="grey", linewidth=0.8)
+    ax.set_title("Weekday shape (relative to own mean); red = constraint window")
+    ax.set_xlabel("Hour of day")
+    ax.set_ylabel("Load / mean")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # 3. who makes up the total, by hour of day
+    ax = axes[1, 0]
+    byh = frame[sites].groupby(frame.index.hour).mean()
+    ax.stackplot(byh.index, byh.T.values, labels=[s[:30] for s in sites], alpha=0.85)
+    _shade(ax, constraint_hours, 0.06)
+    ax.set_title("Customers' mean load by hour of day (stacked)")
+    ax.set_xlabel("Hour of day")
+    ax.set_ylabel("kW")
+    ax.legend(fontsize=7, loc="upper left")
+    ax.grid(True, alpha=0.3)
+
+    # 4. hourly scatter
+    ax = axes[1, 1]
+    hourly = frame[["grid_kw", "customers_total_kw"]].resample("h").mean().dropna()
+    inw = hourly.index.hour.isin(constraint_hours)
+    ax.scatter(hourly["grid_kw"][~inw], hourly["customers_total_kw"][~inw], s=4, alpha=0.3,
+               color="grey", label="other hours")
+    ax.scatter(hourly["grid_kw"][inw], hourly["customers_total_kw"][inw], s=4, alpha=0.5,
+               color="tab:red", label="constraint window")
+    ax.set_title(f"Hourly: customers vs grid (r = {_corr(hourly['customers_total_kw'], hourly['grid_kw']):+.2f})")
+    ax.set_xlabel("Grid (kW)")
+    ax.set_ylabel("Customers total (kW)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(path, dpi=120)
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
+def main(cfg=L.CONFIG, cmp=CONFIG_CMP):
+    gpath = cfg.get("grid_consumption", {}).get("csv_path")
+    if not gpath or not os.path.exists(gpath):
+        raise FileNotFoundError(f"Grid file {gpath!r} not found -- set CONFIG['grid_consumption']['csv_path'] in lpc_8.py.")
+    series = load_customers(cfg)
+    grid = L.load_grid_consumption(cfg)
+    constraint_hours, _ = L.derive_constraint_window_hours(grid, cfg)
+    frame = combine(series, grid, cmp)
+    sites = list(series)
+    summary = summarise(frame, sites, constraint_hours, cmp, cfg)
+
+    folder = os.path.dirname(os.path.abspath(cfg["results_csv_path"]))
+    base = os.path.join(folder, cmp["output_prefix"])
+    sep, dec = cfg.get("results_csv_sep", ";"), cfg.get("results_csv_decimal", ",")
+    summary.to_csv(f"{base}_summary.csv", sep=sep, decimal=dec, index=False, encoding="utf-8-sig")
+    if cmp["write_timeseries"]:
+        frame.to_csv(f"{base}_timeseries.csv", sep=sep, decimal=dec, encoding="utf-8-sig",
+                     index_label="timestamp", float_format="%.3f")
+    plot(frame, sites, constraint_hours, f"{base}.png", cmp["show_plot"])
+
+    t = summary.iloc[0]
+    print(f"\n[customers vs grid] {len(sites)} customer(s), {t['period_start']} .. {t['period_end']} "
+          f"({cmp['period']} period, {t['quarter_hours']} quarter-hours)")
+    print(f"  share of grid energy:               {t['share_of_grid_energy']:.2%}")
+    print(f"  share of grid at the grid's peak:   {t['share_of_grid_at_grid_peak']:.2%}  "
+          f"({t['kw_at_grid_peak']:.0f} kW of the customers' {t['peak_kw']:.0f} kW peak)")
+    print(f"  share of grid in constraint window: {t['share_of_grid_in_constraint_window']:.2%}  "
+          f"(hours {constraint_hours})")
+    print(f"  customers' window avg / overall avg: {t['window_avg_over_overall_avg']:.2f}")
+    print(f"  correlation with grid (hourly):     {t['corr_with_grid_hourly']:+.2f}")
+    print("\n  per customer, largest in the constraint window first:")
+    cols = [L.SITE_KEY, "avg_kw_in_constraint_window", "share_of_customers_in_constraint_window",
+            "window_avg_over_overall_avg", "coincidence_with_grid_peak", "corr_with_grid_hourly"]
+    print(summary.iloc[1:][cols].to_string(index=False))
+    print(f"\n  wrote {base}_summary.csv" + (f", {base}_timeseries.csv" if cmp["write_timeseries"] else "")
+          + f", {base}.png")
+    return summary, frame
+
+
+if __name__ == "__main__":
+    main()
