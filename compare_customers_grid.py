@@ -186,11 +186,14 @@ def plot(frame, sites, constraint_hours, path, show, title=""):
     # (Nov-Feb) is drawn without an empty spring/summer in the middle
     d = frame[["grid_kw", "customers_total_kw"]].resample("D").mean().dropna(how="all")
     x = np.arange(len(d))
+    # one kW axis for both, so the customers' size relative to the grid is
+    # what you see (they will sit low on it -- that is the point)
     ax.plot(x, d["grid_kw"].to_numpy(), color="black", label="Grid")
-    ax.set_ylabel("Grid, daily mean (kW)")
-    ax2 = ax.twinx()
-    ax2.plot(x, d["customers_total_kw"].to_numpy(), color="tab:blue", label="Customers total")
-    ax2.set_ylabel("Customers total, daily mean (kW)", color="tab:blue")
+    ax.plot(x, d["customers_total_kw"].to_numpy(), color="tab:blue", label="Customers total")
+    ax.set_ylabel("Daily mean (kW)")
+    ax.set_ylim(bottom=min(0, float(np.nanmin(d.to_numpy()))))
+    share = d["customers_total_kw"].mean() / d["grid_kw"].mean() if d["grid_kw"].mean() else np.nan
+    ax.legend(title=f"customers = {share:.1%} of grid on average", loc="center right")
     ticks = np.unique(np.linspace(0, len(d) - 1, min(len(d), 7)).astype(int))
     ax.set_xticks(ticks)
     ax.set_xticklabels([d.index[i].strftime("%Y-%m-%d") for i in ticks], rotation=30)
