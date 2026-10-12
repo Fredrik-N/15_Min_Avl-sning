@@ -347,6 +347,15 @@ CONFIG = {
         "match_on": "address",      # a Solar file belongs to a site when the ADDRESS after the
                                      # number id is the same as in the consumption file name
                                      # (case, å/ä/ö, punctuation ignored); "id" = same number id
+        "ignore_words": ["forbrukning", "produktion", "production", "consumption", "export",
+                         "import", "inmatning", "uttag", "solel", "solproduktion", "solcell",
+                         "solceller", "pv", "el", "data", "kwh", "matvarden", "timvarden",
+                         "kvartsvarden"],
+                                     # words that describe the FILE, not the address. They are
+                                     # dropped from both names before comparing, so
+                                     # "735 Knut Påls väg 9 förbrukning" matches
+                                     # "731 Knut Påls väg 9 Produktion". Write them without
+                                     # å/ä/ö, lower case. Add your own if a site is not matched.
         "id_pattern": r"^\s*(\d+)",  # the number id at the start of a file name
         "file_kind": "export",      # what the production file holds:
                                      #   "export"     energy fed into the grid at the meter
@@ -693,15 +702,17 @@ DATA_EXT = (".csv", ".xlsx", ".xls", ".xlsm", ".txt")
 def site_address(path, cfg):
     """The address part of a file name: the name without its extension and
     without the leading number id, lower case, å/ä/ö -> a/a/o, punctuation
-    and repeated spaces removed. '7359991240001455955 Långebergavägen 190.xlsx'
-    -> 'langebergavagen 190'."""
+    and repeated spaces removed, and the words in CONFIG["solar"]["ignore_words"]
+    (förbrukning, produktion, export ...) dropped.
+    '735 Knut Påls väg 9 förbrukning.csv' -> 'knut pals vag 9'."""
     import re
     import unicodedata
     name = os.path.splitext(os.path.basename(str(path)))[0]
     name = re.sub(cfg["solar"]["id_pattern"], "", name, count=1)
     name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
     name = re.sub(r"[^0-9a-zA-Z]+", " ", name).strip().lower()
-    return name
+    drop = {str(w).lower() for w in (cfg["solar"].get("ignore_words") or [])}
+    return " ".join(w for w in name.split() if w not in drop)
 
 
 def find_production_files(meter_path, cfg):
@@ -738,8 +749,12 @@ def find_production_files(meter_path, cfg):
               f"cannot match a Solar file")
         return [], f
     exact = [n for n in names if site_address(n, cfg) == addr]
-    if exact:
-        return [os.path.join(f, n) for n in exact], f
+    if len(exact) == 1:
+        return [os.path.join(f, exact[0])], f
+    if len(exact) > 1:
+        print(f"[solar] WARNING: several Solar files have the address '{addr}': {exact} -- none used. "
+              f"Keep one per site (or set CONFIG['solar']['match_on'] = 'id').")
+        return [], f
     words = addr.split()
     part = [n for n in names if all(w in site_address(n, cfg).split() for w in words)]
     if len(part) == 1:
