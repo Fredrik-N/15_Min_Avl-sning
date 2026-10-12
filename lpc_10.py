@@ -49,8 +49,8 @@ Pipeline
     the grid's winter constraint window (kW) and the top ones are selected
     until they hold 80 % of that kW, (3) hint columns (solar, on/off
     cycling) support the final choice by hand. See CONFIG["selection"].
-12. Solar (lpc_10): the export file in the Solar folder (same number id
-    as the consumption file) is subtracted: every number describes NET
+12. Solar (lpc_10): the export file in the Solar folder (same address
+    after the number id as the consumption file) is subtracted: every number describes NET
     exchange, and PV sites are flagged (pv_flag, pv_reason, export_share).
     Screening shape metrics use winter months only (shape_months).
 13. Rerun all sites: `python lpc_10.py --rerun-all` re-analyses every site
@@ -328,8 +328,8 @@ CONFIG = {
     # ---- solar PV behind the meter ----
     # The meter only sees what crosses the property boundary. A site with
     # PV feeds its surplus into the grid; that EXPORT is in a separate file
-    # in the "Solar" folder, whose name starts with the same number id as
-    # the site's consumption file. The script builds one NET series per
+    # in the "Solar" folder, whose name has the same ADDRESS (the part after
+    # the number id) as the site's consumption file. The script builds one NET series per
     # site:  net kW = import kW - export kW  for each 15-min interval.
     #   - both files are read the same way (same timestamp column, units,
     #     energy-per-interval -> kW), and checked for the same interval
@@ -344,6 +344,9 @@ CONFIG = {
         "folder": "Solar",          # folder name or path. A bare name is looked for next to
                                      # the consumption file, one level up, and in the working
                                      # directory (in that order)
+        "match_on": "address",      # a Solar file belongs to a site when the ADDRESS after the
+                                     # number id is the same as in the consumption file name
+                                     # (case, å/ä/ö, punctuation ignored); "id" = same number id
         "id_pattern": r"^\s*(\d+)",  # the number id at the start of a file name
         "file_kind": "export",      # what the production file holds:
                                      #   "export"     energy fed into the grid at the meter
@@ -684,24 +687,68 @@ def site_number_id(path, cfg):
     return m.group(1) if m else None
 
 
+DATA_EXT = (".csv", ".xlsx", ".xls", ".xlsm", ".txt")
+
+
+def site_address(path, cfg):
+    """The address part of a file name: the name without its extension and
+    without the leading number id, lower case, å/ä/ö -> a/a/o, punctuation
+    and repeated spaces removed. '7359991240001455955 Långebergavägen 190.xlsx'
+    -> 'langebergavagen 190'."""
+    import re
+    import unicodedata
+    name = os.path.splitext(os.path.basename(str(path)))[0]
+    name = re.sub(cfg["solar"]["id_pattern"], "", name, count=1)
+    name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
+    name = re.sub(r"[^0-9a-zA-Z]+", " ", name).strip().lower()
+    return name
+
+
 def find_production_files(meter_path, cfg):
-    """Files in the Solar folder whose name starts with the same number id
-    as the consumption file. Returns (list of paths, folder searched)."""
+    """
+    Files in the Solar folder that belong to this consumption file.
+    CONFIG["solar"]["match_on"]:
+      "address"  (default) the address after the number id must be the same
+                 (case, å/ä/ö, punctuation and spaces ignored). If no name is
+                 exactly the same, a Solar file whose name holds every word of
+                 the address plus extra words ("... 190 produktion") is used --
+                 but only if exactly one such file exists; more than one is
+                 reported and none is used (a wrong house number must not slip
+                 in: "190" never matches "19" or "1900").
+      "id"       the number id at the start of the name must be the same.
+    Returns (list of paths, folder searched).
+    """
     sol = cfg.get("solar") or {}
-    sid = site_number_id(meter_path, cfg)
-    if not sid or not sol.get("folder"):
+    if not sol.get("folder"):
         return [], None
     folder = sol["folder"]
     here = os.path.dirname(os.path.abspath(str(meter_path)))
     cands = [folder] if os.path.isabs(folder) else \
         [os.path.join(here, folder), os.path.join(os.path.dirname(here), folder), os.path.join(os.getcwd(), folder)]
-    for f in cands:
-        if os.path.isdir(f):
-            hits = sorted(os.path.join(f, n) for n in os.listdir(f)
-                          if not n.startswith((".", "~$")) and site_number_id(n, cfg) == sid
-                          and n.lower().endswith((".csv", ".xlsx", ".xls", ".xlsm", ".txt")))
-            return hits, f
-    return [], None
+    f = next((c for c in cands if os.path.isdir(c)), None)
+    if f is None:
+        return [], None
+    names = sorted(n for n in os.listdir(f) if not n.startswith((".", "~$")) and n.lower().endswith(DATA_EXT))
+    if sol.get("match_on", "address") == "id":
+        sid = site_number_id(meter_path, cfg)
+        return ([os.path.join(f, n) for n in names if sid and site_number_id(n, cfg) == sid], f)
+    addr = site_address(meter_path, cfg)
+    if not addr:
+        print(f"[solar] WARNING: no address in the file name {os.path.basename(str(meter_path))!r} -- "
+              f"cannot match a Solar file")
+        return [], f
+    exact = [n for n in names if site_address(n, cfg) == addr]
+    if exact:
+        return [os.path.join(f, n) for n in exact], f
+    words = addr.split()
+    part = [n for n in names if all(w in site_address(n, cfg).split() for w in words)]
+    if len(part) == 1:
+        print(f"[solar] matched {part[0]!r} to address '{addr}' (its name has extra words)")
+        return [os.path.join(f, part[0])], f
+    if len(part) > 1:
+        print(f"[solar] WARNING: several Solar files contain the address '{addr}': {part} -- none used. "
+              f"Rename them so the address part is exactly '{addr}', or keep one.")
+    return [], f
 
 
 def _autodetect_time_value(df, cfg):
@@ -832,7 +879,7 @@ def load_net_series(cfg):
     if not files:
         net = imp
         exp15 = None
-        print(f"[solar] no production file for id {site_number_id(cfg['csv_path'], cfg)} "
+        print(f"[solar] no production file for '{site_address(cfg['csv_path'], cfg)}' "
               f"({'folder ' + folder if folder else 'no Solar folder found'}) -> net = import")
     else:
         parts, pinfo = [], []
