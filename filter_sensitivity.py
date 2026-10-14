@@ -6,9 +6,14 @@ by lpc_10.py). The metrics are read ONCE, saved to
 filter_sensitivity_metrics.csv, and every set of thresholds is applied to
 that one table -- nothing is recomputed between runs. No randomness.
 
-Step 0  The baseline (CONFIG below) is applied and compared with the
-        current result in site_comparison.csv (filter_pass, and the final
-        group). If they differ, the script prints why and STOPS.
+The BASELINE is read from lpc_10.py's SELECTION (thresholds, upper
+bounds, decimals, rank_by, trim rule, exceptions), so the two scripts
+cannot disagree. Only the TESTED values are set here (CONFIG["filters"]).
+
+Step 0  lpc_10's own selection code is run on site_comparison.csv and
+        compared with (a) the filter_pass / selected columns stored in the
+        file and (b) this script's re-implementation. Any difference is
+        printed and the script STOPS.
 A       One-at-a-time sweep (one threshold moved, the others at baseline).
 B       Full grid, every combination (3 x 3 x 3 x 3 = 81): selection
         frequency per site.
@@ -42,13 +47,15 @@ CONFIG = {
     "csv_decimal": ",",
     "output_dir": "filter_sensitivity_out",
     "site_key": "site_id",
+    # The screening script whose SELECTION is the baseline (in this folder).
+    "lpc_module": "lpc_10",
+    # True: baseline, upper bounds, decimals, rank_by, trim and exceptions
+    # are taken from lpc_10's SELECTION (the values below are overwritten).
+    "baseline_from_lpc": True,
 
-    # The four filters. "baseline" is the threshold of the current
-    # screening, "values" the thresholds tested (the baseline must be one of
-    # them). "kind": "min" = value must be >= threshold.
-    # "fixed_max": an upper bound that is NOT varied (e.g. the weekend ratio
-    # max 1.15 if your lpc_10 run used one). None = no upper bound. It must
-    # be the same as in lpc_10's SELECTION or Step 0 will not match.
+    # The four filters and the thresholds TESTED for each ("values"; the
+    # baseline must be one of them). "baseline" and "fixed_max" (an upper
+    # bound that is not varied) come from lpc_10 when baseline_from_lpc.
     "filters": {
         "coverage_fraction": {"label": "Coverage", "baseline": 0.8,
                               "values": [0.7, 0.8, 0.9], "fixed_max": None},
@@ -118,6 +125,57 @@ def _truthy(s):
 
 def _norm(x):
     return str(x).strip().lower()
+
+
+def load_lpc(cfg):
+    import importlib
+    sys.path.insert(0, os.getcwd())
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        return importlib.import_module(cfg["lpc_module"])
+    except ImportError as e:
+        sys.exit(f"Cannot import {cfg['lpc_module']}.py ({e}). Put filter_sensitivity.py in the folder with it.")
+
+
+def sync_with_lpc(cfg, L):
+    """Take the baseline from lpc_10's SELECTION. Stops on settings the
+    sensitivity test cannot reproduce."""
+    sel = L.CONFIG.get("selection") or L.SELECTION
+    lf = {c: sp for c, sp in sel.get("filters", {}).items() if sp.get("enabled", True)}
+    extra = set(lf) - set(cfg["filters"])
+    missing = set(cfg["filters"]) - set(lf)
+    if extra or missing:
+        sys.exit(f"lpc_10's SELECTION filters differ from the four tested here: extra {sorted(extra)}, "
+                 f"switched off/missing {sorted(missing)}. Make them the same four.")
+    for c, sp in lf.items():
+        if sp.get("min") is None:
+            sys.exit(f"lpc_10 filter {c} has no 'min' -- the test varies the minimum.")
+        cfg["filters"][c]["baseline"] = sp["min"]
+        cfg["filters"][c]["fixed_max"] = sp.get("max")
+        vals = cfg["filters"][c]["values"]
+        if not any(abs(v - sp["min"]) < 1e-9 for v in vals):
+            sys.exit(f"lpc_10's baseline for {c} is {sp['min']}, which is not among the tested values {vals}. "
+                     f"Set CONFIG['filters']['{c}']['values'] to include it.")
+    hand = {k: sel.get(k) for k in ("force_pass", "force_fail", "force_select", "force_deselect") if sel.get(k)}
+    if hand:
+        sys.exit(f"lpc_10's SELECTION has sites chosen by hand: {hand}. The test cannot vary hand choices. "
+                 f"Put the large site in SELECTION['exceptions'] and let SELECTION['trim'] drop the small "
+                 f"ones; empty force_pass/force_fail/force_select/force_deselect; run `python "
+                 f"{cfg['lpc_module']}.py --rank-only`, then rerun this.")
+    if sel.get("select_mode", "cumulative_share") != "all_passing":
+        sys.exit(f"lpc_10's select_mode is {sel.get('select_mode')!r}; the base case is 'all_passing' + trim. "
+                 f"Set SELECTION['select_mode'] = 'all_passing'.")
+    cfg["compare_decimals"] = sel.get("compare_decimals")
+    cfg["missing_value_fails"] = sel.get("missing_value_fails", True)
+    cfg["share_by"] = sel.get("rank_by", cfg["share_by"])
+    cfg["baseline_trim"] = sel.get("trim") or {"rule": "n_smallest", "n": 0}
+    cfg["exception_sites"] = dict(sel.get("exceptions") or {})
+    print("[baseline from lpc_10] " + "; ".join(
+        f"{c} >= {s['baseline']}" + (f" and <= {s['fixed_max']}" if s.get("fixed_max") is not None else "")
+        for c, s in cfg["filters"].items())
+        + f"; decimals {cfg['compare_decimals']}; trim {cfg['baseline_trim']}; exceptions "
+        + (", ".join(cfg["exception_sites"]) or "none"))
+    return sel
 
 
 def read_metrics(cfg):
@@ -191,11 +249,13 @@ def build_table(cfg):
     # exception sites
     exc = {_norm(k): v for k, v in (cfg["exception_sites"] or {}).items()}
     source = "CONFIG['exception_sites']"
-    if not exc and "selection_note" in t.columns:
+    if not exc and not cfg.get("baseline_from_lpc") and "selection_note" in t.columns:
         note = t["selection_note"].fillna("").astype(str)
         m = note.str.contains(r"passed by hand|(?<!de)selected by hand", case=False, regex=True)
         exc = {_norm(s): n for s, n in zip(t.loc[m, key], note[m])}
         source = "selection_note in site_comparison.csv (force_pass / force_select)"
+    elif cfg.get("baseline_from_lpc"):
+        source = "lpc_10 SELECTION['exceptions']"
     unknown = set(exc) - set(t[key].map(_norm))
     if unknown:
         sys.exit(f"Exception site(s) not in {cfg['comparison_csv']}: {sorted(unknown)}")
@@ -286,29 +346,49 @@ def reference_group(t, cfg):
     return {_norm(x) for x in ref}, "CONFIG['reference_final_group']"
 
 
-def baseline_check(t, cfg):
+def baseline_check(t, cfg, L=None):
     key = cfg["site_key"]
     base = {c: s["baseline"] for c, s in cfg["filters"].items()}
     ok = apply_filters(t, base, cfg)
     passing = t.index[ok & ~t["is_exception"]]
-    problems = []
-    # 1. filter pass vs site_comparison.csv (exceptions excluded: lpc marks them as passing by hand)
-    if "filter_pass" in t.columns:
-        lpc = _truthy(t["filter_pass"]) & ~t["is_exception"]
-        mine = ok & ~t["is_exception"]
-        for i in t.index[lpc != mine]:
-            r = t.loc[i]
-            vals = ", ".join(f"{c} {r[c]}" for c in cfg["filters"])
-            problems.append(f"filter: {r[key]} passes in site_comparison.csv = {bool(lpc[i])}, here = "
-                            f"{bool(mine[i])} ({vals}; lpc said: {r.get('filter_fail_reasons', '')!s})")
-    # 2. the final group
     grp, drop, dsh = final_group(t, list(passing), cfg)
-    mine_f = set(t.loc[grp, key].map(_norm))
-    ref, src = reference_group(t, cfg)
-    for s in sorted(ref - mine_f):
-        problems.append(f"final group: {s} is in {src} but not reproduced here")
-    for s in sorted(mine_f - ref):
-        problems.append(f"final group: {s} is reproduced here but not in {src}")
+    mine_pass = set(t.loc[passing, key])
+    mine_f = set(t.loc[grp, key])
+    problems = []
+    raw = read_metrics(cfg)
+    stored_pass = set(raw.loc[_truthy(raw["filter_pass"]), key]) if "filter_pass" in raw else None
+    stored_sel = set(raw.loc[_truthy(raw["selected"]), key]) if "selected" in raw else None
+    ex_names = set(t.loc[t["is_exception"], key])
+    if L is not None:
+        # (b) lpc_10's own code on the same table
+        lc = dict(L.CONFIG)
+        out = L.select_sites(raw.copy(), lc)
+        lpc_pass = set(out.loc[out["filter_pass"].astype(bool), key]) - ex_names
+        lpc_sel = set(out.loc[out["selected"].astype(bool), key])
+        for s in sorted(lpc_pass ^ mine_pass):
+            r = t.set_index(key).loc[s]
+            problems.append(f"filter (re-implementation vs lpc_10 code): {s} passes in lpc_10 = {s in lpc_pass}, "
+                            f"here = {s in mine_pass} ({', '.join(f'{c} {r[c]}' for c in cfg['filters'])})")
+        for s in sorted(lpc_sel ^ mine_f):
+            problems.append(f"final group (re-implementation vs lpc_10 code): {s} in lpc_10 = {s in lpc_sel}, "
+                            f"here = {s in mine_f}")
+        # (a) is the stored file up to date with SELECTION?
+        stale = []
+        if stored_pass is not None and (stored_pass - ex_names) != lpc_pass:
+            stale.append("filter_pass")
+        if stored_sel is not None and stored_sel != lpc_sel:
+            stale.append("selected")
+        if stale:
+            problems.append(f"site_comparison.csv is out of date with lpc_10's SELECTION (columns {', '.join(stale)} "
+                            f"differ: stored selection {sorted(stored_sel or [])} vs now {sorted(lpc_sel)}). Run "
+                            f"`python {cfg['lpc_module']}.py --rank-only` and rerun this.")
+        src = f"{cfg['lpc_module']}.py's selection of site_comparison.csv"
+    else:
+        ref, src = reference_group(t, cfg)
+        for s in sorted(ref - {x.lower() for x in mine_f}):
+            problems.append(f"final group: {s} is in {src} but not reproduced here")
+        for s in sorted({x.lower() for x in mine_f} - ref):
+            problems.append(f"final group: {s} is reproduced here but not in {src}")
     return {"passing": list(passing), "final": grp, "dropped": drop, "dropped_share": dsh,
             "problems": problems, "reference_source": src}
 
@@ -540,6 +620,10 @@ def write(df, name, cfg, index=False):
 def main(cfg=CONFIG, skip_check=False):
     os.makedirs(cfg["output_dir"], exist_ok=True)
     key = cfg["site_key"]
+    L = None
+    if cfg.get("baseline_from_lpc"):
+        L = load_lpc(cfg)
+        sync_with_lpc(cfg, L)
     t, exc_source = build_table(cfg)
     write(t, "filter_sensitivity_metrics.csv", cfg)
     exc_names = t.loc[t["is_exception"], key].tolist()
@@ -547,14 +631,13 @@ def main(cfg=CONFIG, skip_check=False):
           f"{exc_names or 'none'} (from {exc_source})")
 
     # ---- step 0
-    chk = baseline_check(t, cfg)
+    chk = baseline_check(t, cfg, L)
     if chk["problems"]:
         print("\n[step 0] the baseline is NOT reproduced:")
         for p in chk["problems"]:
             print("   - " + p)
-        print("\n  Usual causes: the thresholds/decimals/weekend max in CONFIG differ from lpc_10's SELECTION; "
-              "the trim rule is not the one that was used; the exception site is not marked; "
-              "site_comparison.csv was not updated (python lpc_10.py --rank-only).")
+        print("\n  If the file is out of date: python lpc_10.py --rank-only. Any other line is a mismatch "
+              "between lpc_10 and this script -- send it to me.")
         with open(os.path.join(cfg["output_dir"], "step0_baseline_check.txt"), "w", encoding="utf-8") as fh:
             fh.write("NOT reproduced\n" + "\n".join(chk["problems"]) + "\n")
         if not skip_check:

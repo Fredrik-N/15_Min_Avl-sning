@@ -106,13 +106,15 @@ SELECTION = {
     # add a line to filter on any other column of the comparison file.
     # "shift" is how far the robustness check moves the threshold.
     "filters": {
+        # Base case of the thesis (filter_sensitivity.py reads these values).
         "coverage_fraction":               {"min": 0.80, "shift": 0.05, "enabled": True,
                                             "why": "enough data to judge the site"},
-        "load_factor_winter":              {"min": 0.50, "shift": 0.05, "enabled": True,
+        "load_factor_winter":              {"min": 0.40, "shift": 0.05, "enabled": True,
                                             "why": "cold storage runs 24/7, so its load is flat"},
-        "weekend_to_weekday_ratio_winter": {"min": 0.85, "max": 1.15, "shift": 0.05, "enabled": True,
+        "weekend_to_weekday_ratio_winter": {"min": 0.80, "shift": 0.05, "enabled": True,
                                             "why": "refrigeration does not stop at weekends"},
-        "temp_corr_winter_best_lag_value": {"min": 0.20, "shift": 0.05, "enabled": True,
+                                            # add "max": 1.15 here for an upper bound
+        "temp_corr_winter_best_lag_value": {"min": 0.15, "shift": 0.05, "enabled": True,
                                             "why": "cooling load follows outdoor temperature"},
     },
     # Values are rounded to this many decimals BEFORE they are compared with
@@ -129,10 +131,25 @@ SELECTION = {
     #   "top_n"             the select_top_n best
     #   "min_value"         every passing site with rank_by >= select_min_value
     #   "all_passing"       every site that passes the filters
-    "select_mode": "cumulative_share",
+    "select_mode": "all_passing",
     "select_cumulative_share": 0.80,
     "select_top_n": 5,
     "select_min_value": 20.0,
+    # Tail trim, applied after select_mode: the smallest contributors among
+    # the selected sites are dropped. Shares are of the rank_by kW of all
+    # sites that pass the filters (exceptions below are not in it).
+    #   {"rule": "n_smallest", "n": 3}          the n smallest
+    #   {"rule": "tail_share", "share": 0.075}  the smallest sites that together
+    #                                           hold at most this share
+    #   {"rule": "min_share", "share": 0.02}    every site under this share
+    #   None                                    no trim
+    "trim": {"rule": "n_smallest", "n": 3},
+
+    # ---- exceptions: sites in the final group although they FAIL the
+    # filters (e.g. a large verified cold store). They keep filter_pass =
+    # False, are selected, are never trimmed and are not in the trim's share.
+    # {site_id: "why"}, the site id exactly as in site_comparison.csv.
+    "exceptions": {},
 
     # ---- by hand (site ids as in site_comparison.csv; case and spaces ignored)
     # {site_id: "why"} -- the reason is written next to the site.
@@ -2246,6 +2263,44 @@ def _select(df, passed, sel):
     return rank, cum, selected
 
 
+def trim_drop(values, rule):
+    """Index of the sites dropped by a tail-trim rule. values: rank_by kW of
+    the sites that may be trimmed (the shares are of their sum, negative
+    values counted as 0)."""
+    if not rule or not rule.get("rule") or len(values) == 0:
+        return []
+    v = values.clip(lower=0).fillna(0)
+    tot = v.sum()
+    sh = (v / tot) if tot > 0 else v * 0
+    order = sh.sort_values(kind="mergesort")
+    r = rule["rule"]
+    if r == "n_smallest":
+        return list(order.index[:int(rule["n"])])
+    if r == "tail_share":
+        cum = order.cumsum()
+        return list(cum.index[cum <= rule["share"] + 1e-12])
+    if r == "min_share":
+        return list(order.index[order < rule["share"]])
+    raise ValueError(f"SELECTION['trim'] rule {r!r}: use 'n_smallest', 'tail_share', 'min_share' or None")
+
+
+def _select_trim(df, passed, sel):
+    """Stage 2 + tail trim + exceptions (before force_select/force_deselect).
+    Exceptions never count as passing: they are left out of the ranking,
+    the shares and the trim, and are then added to the selection."""
+    ex, _ = _keymatch(df, sel.get("exceptions"))
+    p = passed & ~ex
+    rank, cum, selected = _select(df, p, sel)
+    key = sel["rank_by"]
+    vals = pd.to_numeric(df[key], errors="coerce") if key in df.columns else pd.Series(np.nan, index=df.index)
+    drop = trim_drop(vals[selected & p & vals.notna()], sel.get("trim"))
+    tot = vals[p & vals.notna()].clip(lower=0).sum()
+    selected = selected.copy()
+    selected[drop] = False
+    selected[ex] = True
+    return rank, cum, selected, drop, tot
+
+
 def _forced_filter(df, passed, sel):
     passed = passed.copy()
     passed[_keymatch(df, sel.get("force_pass"))[0]] = True
@@ -2292,14 +2347,22 @@ def select_sites(df, cfg):
     ff, why = _keymatch(df, sel.get("force_fail"))
     passed[ff] = False
     reasons[ff] = ("failed by hand: " + why[ff] + "; " + reasons[ff]).str.rstrip("; ")
-    rank, cum, selected = _select(df, passed, sel)
+    ex, why = _keymatch(df, sel.get("exceptions"))
+    rank, cum, selected, drop, tot = _select_trim(df, passed, sel)
+    key = sel["rank_by"]
+    vals = pd.to_numeric(df[key], errors="coerce") if key in df.columns else pd.Series(np.nan, index=df.index)
+    for i in drop:
+        note[i] = (note[i] + (f"; dropped by tail trim ({max(vals[i], 0) / tot:.1%} of the passing sites' {key})"
+                              if tot > 0 else "; dropped by tail trim")).lstrip("; ")
+    note[ex] = (note[ex] + "; EXCEPTION (fails the filters, in the group by hand): " + why[ex]
+                + reasons[ex].map(lambda r: f" [{r}]" if r else "")).str.lstrip("; ")
     fs, why = _keymatch(df, sel.get("force_select"))
     selected[fs] = True
     note[fs] = (note[fs] + "; selected by hand: " + why[fs]).str.lstrip("; ")
     fd, why = _keymatch(df, sel.get("force_deselect"))
     selected[fd] = False
     note[fd] = (note[fd] + "; deselected by hand: " + why[fd]).str.lstrip("; ")
-    for d_name in ("force_pass", "force_fail", "force_select", "force_deselect"):
+    for d_name in ("force_pass", "force_fail", "force_select", "force_deselect", "exceptions"):
         m, _ = _keymatch(df, sel.get(d_name))
         unknown = {str(k).strip().lower() for k in (sel.get(d_name) or {})} - \
             set(df.loc[m, SITE_KEY].astype(str).str.strip().str.lower())
@@ -2349,7 +2412,7 @@ def sensitivity(df, cfg):
     filters = {k: v for k, v in filters.items() if v.get("enabled", True)}
     base_pass, _ = _filter(df, filters, sel.get("missing_value_fails", True), sel.get("compare_decimals"))
     base_pass = _forced_filter(df, base_pass, sel)
-    _, _, base_sel = _select(df, base_pass, sel)
+    _, _, base_sel, _, _ = _select_trim(df, base_pass, sel)
     base_sel = _forced_select(df, base_sel, sel)
     base_set = set(df.loc[base_sel, SITE_KEY].astype(str))
 
@@ -2372,7 +2435,7 @@ def sensitivity(df, cfg):
             f2 = moved(which, sign)
             p2, _ = _filter(df, f2, sel.get("missing_value_fails", True), sel.get("compare_decimals"))
             p2 = _forced_filter(df, p2, sel)
-            _, _, s2 = _select(df, p2, sel)
+            _, _, s2, _, _ = _select_trim(df, p2, sel)
             s2 = _forced_select(df, s2, sel)
             new_set = set(df.loc[s2, SITE_KEY].astype(str))
             rows.append({"threshold": which, "moved": f"{label} by {filters[which].get('shift', 0) if which != 'all' else 'each shift'}",
@@ -2444,6 +2507,13 @@ def rank_only(cfg=CONFIG):
            "top_n": f"the top {sel.get('select_top_n')} selected",
            "min_value": f"selected if >= {sel.get('select_min_value')}",
            "all_passing": "all passing sites selected"}.get(mode, mode)
+    tr = sel.get("trim")
+    if tr and tr.get("rule"):
+        how += {"n_smallest": f"; then the {tr.get('n')} smallest dropped",
+                "tail_share": f"; then the smallest sites holding <= {tr.get('share', 0):.1%} dropped",
+                "min_share": f"; then every site under {tr.get('share', 0):.1%} dropped"}.get(tr["rule"], "")
+    if sel.get("exceptions"):
+        how += f"; exceptions added: {', '.join(map(str, sel['exceptions']))}"
     print(f"\n  stage 2 -- passing sites ranked by {sel.get('rank_by')}; {how}:")
     cols = [c for c in ["rank", "selected", SITE_KEY, sel.get("rank_by"), "cumulative_share", "pv_flag", "selection_note",
                         "window_avg_frac_of_overall_avg_winter", "hint_solar", "hint_cycling"] if c in out.columns]
