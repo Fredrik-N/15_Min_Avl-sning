@@ -34,7 +34,7 @@ winter, derived from Öresundskraft's grid load exactly as in lpc_8):
 This is a GROUP-level FLOOR. It is not the per-site theoretical
 potential (a per-site ceiling) and is not written into site_comparison.csv.
 
-Run (from the folder with lpc_8.py, which supplies the meter reading,
+Run (from the folder with lpc_9.py -- or lpc_8.py -- which supplies the meter reading,
 grid file, seasons and site_comparison.csv settings):
     python portfolio.py --mode 15min
     python portfolio.py --mode 1s
@@ -57,7 +57,12 @@ import sys
 import numpy as np
 import pandas as pd
 
-import lpc_8 as L
+L = None        # the lpc script module (lpc_9.py / lpc_8.py), loaded by load_lpc()
+
+# What portfolio.py uses from the lpc script. Older copies of lpc_8.py
+# (before the winter ranking) lack winter_and_hint_metrics.
+LPC_NEEDED = ["CONFIG", "SITE_KEY", "_read_table", "_select_channel_rows", "_to_float", "_infer_interval_hours",
+              "winter_and_hint_metrics", "read_comparison", "find_meter_file", "load_grid_consumption"]
 
 CONFIG = {
     "output_dir": "portfolio_out",
@@ -161,6 +166,11 @@ CONFIG = {
         "export_share": 0.01,        # net <= 0 in more than 1 % of quarter-hours
     },
 
+    # Which lpc script to take the settings and readers from: a module name
+    # ("lpc_9") or a path ("C:/.../lpc_9.py"). None = the newest of lpc_9,
+    # lpc_8 next to this file that has everything needed (printed at start).
+    "lpc_module": None,
+
     # Overrides applied on top of lpc_8.CONFIG (its meter format, grid
     # file, comparison file, seasons, csv separator). Leave {} to use
     # lpc_8.py's own settings, e.g.
@@ -180,6 +190,36 @@ def _deep_update(base, new):
         else:
             base[k] = v
     return base
+
+
+def load_lpc(spec=None):
+    """Import the lpc script and check it has what this script needs."""
+    import importlib
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    cands = [spec] if spec else ["lpc_10", "lpc_9", "lpc_8"]
+    tried = []
+    for c in cands:
+        try:
+            if str(c).endswith(".py"):
+                sp = importlib.util.spec_from_file_location(os.path.splitext(os.path.basename(c))[0], c)
+                mod = importlib.util.module_from_spec(sp)
+                sp.loader.exec_module(mod)
+            else:
+                mod = importlib.import_module(c)
+        except Exception as e:                          # not there, or does not import
+            tried.append(f"{c}: {type(e).__name__}: {e}")
+            continue
+        missing = [n for n in LPC_NEEDED if not hasattr(mod, n)]
+        if missing:
+            tried.append(f"{c} ({getattr(mod, '__file__', '?')}): too old, lacks {', '.join(missing)}")
+            continue
+        print(f"[lpc] using {getattr(mod, '__file__', c)}")
+        return mod
+    raise ImportError("No usable lpc script found:\n  " + "\n  ".join(tried)
+                      + "\nPut lpc_10.py next to portfolio.py, or set CONFIG['lpc_module'] / --lpc to its path.")
 
 
 def lpc_config(cfg):
@@ -314,6 +354,24 @@ def load_meter_net(path, lcfg, cfg):
     step_h = L._infer_interval_hours(imp.index.tz_convert("UTC").tz_localize(None))
     scale = (1.0 / step_h) if energy else (1.0 / divisor)
     net = imp * scale
+    # export from the site's file(s) in the Solar folder (lpc_10 and later):
+    # same reader and clock as lpc, a missing export value is a gap
+    info["production_files"] = ""
+    sol = lcfg.get("solar") or {}
+    if hasattr(L, "find_production_files") and sol.get("folder"):
+        files, _ = L.find_production_files(path, lcfg)
+        if files:
+            parts = [L.read_energy_file(f, lcfg, sol.get("channel_values"))[0] for f in files]
+            e_naive = parts[0] if len(parts) == 1 else pd.concat(parts, axis=1).sum(axis=1, min_count=len(parts))
+            if sol.get("export_shift_h"):
+                e_naive.index = e_naive.index + pd.Timedelta(hours=float(sol["export_shift_h"]))
+            info["production_files"] = "; ".join(os.path.basename(f) for f in files)
+            if sol.get("file_kind", "export") != "generation":
+                e, _ = localize(e_naive.to_numpy(), e_naive.index, info["time_convention"], tz)
+                h_e = L._infer_interval_hours(e.index.tz_convert("UTC").tz_localize(None))
+                info["export_kwh"] = float(e.sum() * h_e)
+                info["import_kwh"] = float(net.dropna().sum() * step_h)
+                net = net - e.reindex(net.index)              # missing export -> gap, never zero
     if exp is not None:
         e, _ = localize(exp[1], exp[0], info["time_convention"], tz)
         net = net - (e * scale).reindex(net.index)          # export missing -> net missing
@@ -329,22 +387,17 @@ def load_meter_net(path, lcfg, cfg):
     return net.rename("net_kw"), info
 
 
-def solar_flag(net, lcfg, cfg):
-    """'' or the reason this site looks like it has solar."""
-    m = L.winter_and_hint_metrics(net.dropna(), None, lcfg)
-    thr = cfg["solar"]["midday_dip"]
-    if thr is None:
-        thr = (lcfg.get("selection") or {}).get("pv_hint_midday_dip", 0.15)
-    why = []
-    ds, dw = m.get("pv_midday_dip_summer"), m.get("pv_midday_dip_winter")
-    if ds is not None and dw is not None and ds - dw >= thr:
-        why.append(f"summer midday dip {ds:.0%} vs winter {dw:.0%}")
-    elif ds is not None and dw is None and ds >= thr:
-        why.append(f"midday dip {ds:.0%} (no winter data to compare)")
-    z = m.get("share_intervals_at_or_below_zero")
-    if z is not None and z > cfg["solar"]["export_share"]:
-        why.append(f"net <= 0 in {z:.1%} of quarter-hours")
-    return "; ".join(why)
+def solar_flag(net, lcfg, cfg, info=None):
+    """'' or why this site has solar. A site has solar when it has a file in
+    the Solar folder (matched by lpc_10's find_production_files) -- the
+    same rule as lpc_10's pv_flag. Load-shape guesses are NOT used."""
+    info = info or {}
+    files = info.get("production_files")
+    if not files:
+        return ""
+    if info.get("export_kwh") is not None and info.get("import_kwh"):
+        return f"Solar file {files}: exports {info['export_kwh'] / info['import_kwh']:.1%} of import"
+    return f"Solar file {files}"
 
 
 def base_load(net, lcfg, cfg):
@@ -365,7 +418,12 @@ def screened_sites(cfg, lcfg):
     """[(site_id, meter path or None, why included)], [(site_id, why excluded)]"""
     df = L.read_comparison(lcfg)
     if df is None:
-        raise FileNotFoundError(f"No comparison file at {lcfg.get('results_csv_path')!r}; run lpc_8.py first.")
+        raise FileNotFoundError(f"No comparison file at {lcfg.get('results_csv_path')!r}; run lpc_9.py first.")
+    need = {"filter_pass": ["filter_pass"], "selected": ["selected"], "all": []}.get(
+        cfg["screening"].get("include", "filter_pass"), ["filter_pass"])
+    if any(c not in df.columns for c in need):
+        raise ValueError(f"{lcfg.get('results_csv_path')} has no {need[0]!r} column -- it was written by an "
+                         f"older lpc script. Run `python lpc_9.py --rank-only` (or --rerun-all) once, then retry.")
     sc = cfg["screening"]
     inc_rule = sc.get("include", "filter_pass")
     add = {str(k).strip().lower(): (k, v) for k, v in (sc.get("add_sites") or {}).items()}
@@ -426,7 +484,11 @@ def build_15min(sites, cfg, lcfg, label=""):
                      "period_start": str(valid.index.min()), "period_end": str(valid.index.max()),
                      "coverage_fraction": round(len(valid) / len(span), 4) if len(span) else None,
                      "base_load_kw": round(b, 2), "base_load_basis": b_why,
-                     "solar_flag": solar_flag(net, lcfg, cfg), **{f"time_{k}": v for k, v in info.items()}}
+                     "series": "net exchange (import - export)" if info.get("production_files") else "import",
+                     "export_share": round(info["export_kwh"] / info["import_kwh"], 4)
+                     if info.get("export_kwh") is not None and info.get("import_kwh") else None,
+                     "solar_flag": solar_flag(net, lcfg, cfg, info),
+                     **{f"time_{k}": v for k, v in info.items() if k not in ("export_kwh", "import_kwh")}}
         print(f"[15-min{label}] {sid}: {len(valid)} quarter-hours, coverage {meta[sid]['coverage_fraction']:.1%}, "
               f"base {b:.1f} kW ({b_why}), time {info['time_convention']}"
               + (f", SOLAR: {meta[sid]['solar_flag']}" if meta[sid]["solar_flag"] else ""))
@@ -492,8 +554,8 @@ def load_unilm_site(case, cfg):
     cat_all = app.get("category", pd.Series("", index=app.index)).fillna("").astype(str)
     pv_rows = app.loc[cat_all.str.contains("PV-like"), "appliance"].tolist()
     info = {"resolution": f"{res} s", "unilm_output_dir": d,
-            "solar_flag": (f"unilm found PV-like steps ({', '.join(map(str, pv_rows))})" if pv_rows else "")
-            + (" + " if pv_rows and case.get("solar_flag") else "") + (case.get("solar_flag") or ""),
+            "solar_flag": case.get("solar_flag") or "",       # the 15-min meter's Solar file decides (compare mode)
+            "unilm_pv_like_steps": ", ".join(map(str, pv_rows)),
             "period_start": str(s.index[0]), "period_end": str(s.index[-1]),
             "coverage_fraction": round(float(s.notna().mean()), 4),
             "compressors": "; ".join(used), "n_compressors": len(used),
@@ -869,7 +931,7 @@ def plot_correlation(res, cfg, path, meta):
     size = max(4.5, 0.55 * n + 2.5)
     fig, axes = plt.subplots(1, 2, figsize=(2 * size + 1, size))
     for k, (ax, (title, m)) in enumerate(zip(axes, mats)):
-        names = [(_short(s) + (" (solar?)" if meta.get(s, {}).get("solar_flag") else "")) for s in m.index]
+        names = [_short(s) for s in m.index]
         im = ax.imshow(m.to_numpy(dtype=float), cmap=_diverging(), vmin=-1, vmax=1)
         ax.set_xticks(range(n), names, rotation=60, ha="right")
         ax.set_yticks(range(n), names if k == 0 else [""] * n)
@@ -897,10 +959,10 @@ def plot_coverage(site, res, path):
            hatch=["//" if v else "" for v in solar], edgecolor="white")
     for i, (kw, c) in enumerate(zip(s["mean_window_flex_kw"], s["cumulative_share"])):
         ax.text(i, kw, f"{c:.0%}", ha="center", va="bottom", fontsize=8, color=INK)
-    ax.set_xticks(x, [_short(v) + (" (solar?)" if f else "") for v, f in zip(s.index, solar)], rotation=60, ha="right")
+    ax.set_xticks(x, [_short(v) for v in s.index], rotation=60, ha="right")
     ax.set_ylabel("mean flexible kW in the window")
     ax.set_title(f"{res['label']}: sites by mean window flexible kW\n"
-                 f"label = cumulative share of the group; hatched = solar flag", loc="left", color=INK, fontsize=9)
+                 f"label = cumulative share of the group; hatched = solar (site has a Solar export file)", loc="left", color=INK, fontsize=9)
     ax.grid(axis="x", visible=False)
     fig.tight_layout()
     fig.savefig(path, dpi=130)
@@ -1169,11 +1231,14 @@ def main(argv=None):
     ap.add_argument("--mode", choices=["15min", "1s", "compare"], default="15min")
     ap.add_argument("--full-day", action="store_true", help="all 24 hours instead of the constrained window")
     ap.add_argument("--config", help="JSON file whose keys override CONFIG")
+    ap.add_argument("--lpc", help="lpc script to use: module name (lpc_9) or path to the .py file")
     a = ap.parse_args(argv)
     cfg = copy.deepcopy(CONFIG)
     if a.config:
         with open(a.config, encoding="utf-8") as fh:
             _deep_update(cfg, json.load(fh))
+    global L
+    L = load_lpc(a.lpc or cfg.get("lpc_module"))
     lcfg = lpc_config(cfg)
     os.makedirs(cfg["output_dir"], exist_ok=True)
     grid = None
