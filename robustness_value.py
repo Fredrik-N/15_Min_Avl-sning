@@ -39,6 +39,9 @@ import pandas as pd
 # CONFIG
 # ======================================================================
 CONFIG = {
+    # value axis (revised plan: no window; the ranking quantity of lpc_11)
+    "value_col": "median_above_base_year_kw",
+    "value_label": "Median load above base over the year (kW)",
     "sensitivity_dir": "filter_sensitivity_out",
     "comparison_csv": "site_comparison.csv",
     "composite_csv": None,           # an older site_comparison.csv with rank_score / score_* (None = comparison_csv)
@@ -68,7 +71,7 @@ CONFIG = {
     "pv_distorted_factors": ["load_factor", "summer", "temp_corr"],  # factors solar distorts
     "min_factor_gap": 0.15,          # the lowering factor must sit this far (score points) below the median site
     "stretch_spread": 0.05,          # raw values of a factor whose IQR / median is under this are "stretched" by the percentile scoring
-    "size_percentile": 0.5,          # kw_above_base_window below this quantile = "small"
+    "size_percentile": 0.5,          # value_kw below this quantile = "small"
 }
 
 STATUS_ORDER = ["final", "trimmed", "exception", "excluded"]
@@ -168,18 +171,16 @@ def build_anonymiser(site_ids, cfg):
 # ======================================================================
 def build_table(cfg, freq, marg, met, runs, cum, comp, composite):
     key = cfg["site_key"]
-    share_by = None
-    for c in met.columns:
-        if c == "window_above_base_winter_kw":
-            share_by = c
+    share_by = cfg["value_col"] if cfg["value_col"] in met.columns else None
     if share_by is None:
-        sys.exit("filter_sensitivity_metrics.csv has no window_above_base_winter_kw column.")
+        sys.exit(f"filter_sensitivity_metrics.csv has no {cfg['value_col']} column "
+                 f"(rerun filter_sensitivity.py with lpc_11 after `python lpc_11.py --rerun-all`).")
     t = pd.DataFrame({key: met[key]})
     f = freq.set_index(key)
     t["selection_frequency"] = t[key].map(f["selection_frequency"])
-    t["kw_above_base_window"] = pd.to_numeric(met[share_by], errors="coerce").values
-    t["kw_na_reason"] = np.where(t["kw_above_base_window"].isna(),
-                                 "window_above_base_winter_kw missing (no winter data or no grid window)", "")
+    t["value_kw"] = pd.to_numeric(met[share_by], errors="coerce").values
+    t["kw_na_reason"] = np.where(t["value_kw"].isna(),
+                                 f"{share_by} missing (too little data)", "")
     base = runs[runs["run_id"] == "baseline"].iloc[0]
     final = set(str(base["final_group"]).split("|")) if isinstance(base["final_group"], str) else set()
     trimmed = set(str(base["trim_dropped"]).split("|")) if isinstance(base["trim_dropped"], str) else set()
@@ -198,7 +199,7 @@ def build_table(cfg, freq, marg, met, runs, cum, comp, composite):
     t["status"] = t[key].map(status)
     t["is_exception"] = t[key].isin(exc)
     # rank by value (the exception is ranked too: it is in the plot)
-    t["rank_by_kw"] = t["kw_above_base_window"].rank(ascending=False, method="min")
+    t["rank_by_kw"] = t["value_kw"].rank(ascending=False, method="min")
     # cumulative shares: the baseline passing sites (+ exception) as computed by the sensitivity run
     if cum is not None:
         c = cum.set_index(key)
@@ -269,7 +270,7 @@ def disagreements(cfg, t, composite, comp):
     scores = [c for c in composite.columns if c.startswith("score_")]
     cc = composite.set_index(key)
     med = cc[scores].median()
-    kw_cut = t["kw_above_base_window"].quantile(cfg["size_percentile"])
+    kw_cut = t["value_kw"].quantile(cfg["size_percentile"])
     rows = []
     for _, r in dd.iterrows():
         s = r[key]
@@ -302,9 +303,9 @@ def disagreements(cfg, t, composite, comp):
         if r["pv_flag"] == "yes" and big_gap and any(k in driver for k in cfg["pv_distorted_factors"]):
             fits.append("solar")
             evidence.append(f"PV flag set ({r['pv_text']}) and {driver} is one that PV distorts")
-        if fwd_dir and pd.notna(r["kw_above_base_window"]) and r["kw_above_base_window"] < kw_cut:
+        if fwd_dir and pd.notna(r["value_kw"]) and r["value_kw"] < kw_cut:
             fits.append("size")
-            evidence.append(f"kw_above_base_window {r['kw_above_base_window']:.1f} kW is below the "
+            evidence.append(f"value_kw {r['value_kw']:.1f} kW is below the "
                             f"{cfg['size_percentile']:.0%} quantile ({kw_cut:.1f} kW); the composite has no size factor")
         order = ["solar", "weak_factor", "size"]
         cls = next((c for c in order if c in fits), "unclear")
@@ -317,7 +318,7 @@ def disagreements(cfg, t, composite, comp):
         rows.append({
             key: s, "direction": r["direction"], "selection_frequency": r["selection_frequency"],
             "composite_rank": r["composite_rank"], "rank_by_kw": r["rank_by_kw"],
-            "kw_above_base_window": r["kw_above_base_window"], "pv_flag": r["pv_flag"],
+            "value_kw": r["value_kw"], "pv_flag": r["pv_flag"],
             **{c: sc.get(c, np.nan) for c in scores},
             "driving_factor": driver, "driving_factor_gap_vs_median": driver_gap,
             "classification": cls, "evidence": "; ".join(evidence)})
@@ -329,7 +330,7 @@ def disagreements(cfg, t, composite, comp):
         "solar: PV flag set and the driving factor is PV-distorted (" + ", ".join(cfg["pv_distorted_factors"]) + ")",
         "weak_factor: the driving factor is flagged unreliable (" + ", ".join(cfg["unreliable_factors"])
         + f") or its raw values spread < {cfg['stretch_spread']:.0%} (percentile stretching)",
-        f"size: robust-but-low-composite site with kw_above_base_window under the {cfg['size_percentile']:.0%} quantile",
+        f"size: robust-but-low-composite site with value_kw under the {cfg['size_percentile']:.0%} quantile",
         "several fit: solar > weak_factor > size (the others are listed in the evidence); none fits: unclear"]
     counts = out["classification"].value_counts().to_dict() if len(out) else {}
     return out, rule, {"counts": counts, "n_fwd": int(fwd.sum()), "n_rev": int(rev.sum())}
@@ -385,17 +386,17 @@ def chart_robustness_value(cfg, t, names, out_dir, log=False, stem="robustness_v
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    d = t.dropna(subset=["selection_frequency", "kw_above_base_window"]).copy()
+    d = t.dropna(subset=["selection_frequency", "value_kw"]).copy()
     skipped = []
     if log:
-        bad = d["kw_above_base_window"] <= 0
+        bad = d["value_kw"] <= 0
         skipped = d.loc[bad, cfg["site_key"]].tolist()
         d = d[~bad]
     if d.empty:
         return None
-    yt_all = d["kw_above_base_window"].median() if cfg["y_threshold"] == "median" else float(cfg["y_threshold"])
+    yt_all = d["value_kw"].median() if cfg["y_threshold"] == "median" else float(cfg["y_threshold"])
     d_ne = d[~d["is_exception"]]
-    yt_ne = (d_ne["kw_above_base_window"].median() if cfg["y_threshold"] == "median" else yt_all) if len(d_ne) else yt_all
+    yt_ne = (d_ne["value_kw"].median() if cfg["y_threshold"] == "median" else yt_all) if len(d_ne) else yt_all
     xt = cfg["x_threshold"]
     fig, ax = plt.subplots(figsize=(8.2, 6.2))
     for st in STATUS_ORDER + ["passing (not final)"]:
@@ -403,11 +404,11 @@ def chart_robustness_value(cfg, t, names, out_dir, log=False, stem="robustness_v
         if g.empty:
             continue
         sty = STYLE[st]
-        ax.scatter(g["selection_frequency"], g["kw_above_base_window"], marker=sty["marker"], s=sty["s"],
+        ax.scatter(g["selection_frequency"], g["value_kw"], marker=sty["marker"], s=sty["s"],
                    facecolors=sty["fc"], edgecolors=sty["ec"], linewidths=1.3, label=st, zorder=3)
     pv = d[d["pv_flag"] == "yes"]
     if len(pv):
-        ax.scatter(pv["selection_frequency"], pv["kw_above_base_window"], marker="o", s=300, facecolors="none",
+        ax.scatter(pv["selection_frequency"], pv["value_kw"], marker="o", s=300, facecolors="none",
                    edgecolors="#222222", linewidths=1.2, linestyles="--", label="PV site (outer ring)", zorder=2)
     ax.axvline(xt, color="#555555", lw=1.0, ls="--", zorder=1)
     ax.axhline(yt_all, color="#555555", lw=1.0, ls="--", zorder=1)
@@ -416,7 +417,7 @@ def chart_robustness_value(cfg, t, names, out_dir, log=False, stem="robustness_v
     if log:
         ax.set_yscale("log")
     ax.set_xlim(-0.04, 1.08)
-    lo, hi = d["kw_above_base_window"].min(), d["kw_above_base_window"].max()
+    lo, hi = d["value_kw"].min(), d["value_kw"].max()
     if log:
         ax.set_ylim(lo / 1.8, hi * 2.2)
     else:
@@ -434,10 +435,10 @@ def chart_robustness_value(cfg, t, names, out_dir, log=False, stem="robustness_v
         thr_txt += f"\ndotted: {yt_ne:,.1f} kW (median without the exception site)"
     ax.text(0.5, 1.012, thr_txt, transform=ax.transAxes, ha="center", va="bottom", fontsize=8, color="#333333")
     ax.set_xlabel("Selection frequency (share of the 81 filter settings the site passes)")
-    ax.set_ylabel("Mean load above base in the constrained window, winter (kW)" + (" - log scale" if log else ""))
+    ax.set_ylabel(cfg["value_label"] + (" - log scale" if log else ""))
     ax.grid(alpha=0.25, lw=0.5)
     ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8, frameon=False, title="Status")
-    _label_points(ax, fig, d["selection_frequency"].to_numpy(), d["kw_above_base_window"].to_numpy(),
+    _label_points(ax, fig, d["selection_frequency"].to_numpy(), d["value_kw"].to_numpy(),
                   [names[s] for s in d[cfg["site_key"]]])
     _save(fig, out_dir, stem)
     return {"x": xt, "y_all": float(yt_all), "y_no_exception": float(yt_ne), "skipped_log": skipped}
@@ -516,11 +517,11 @@ def main(cfg=CONFIG, rerun=False):
     kdf = pd.DataFrame({"real_site_id": list(mapping), "anonymised_id": list(mapping.values())})
     kdf.to_csv(os.path.join(cfg["private_dir"], "site_id_key.csv"), sep=cfg["csv_sep"], index=False, encoding="utf-8-sig")
     # table (anonymised)
-    t = t.sort_values(["selection_frequency", "kw_above_base_window"], ascending=[False, False], kind="mergesort")
+    t = t.sort_values(["selection_frequency", "value_kw"], ascending=[False, False], kind="mergesort")
     names = dict(mapping)
     out = t.copy()
     out[key] = out[key].map(names)
-    cols = [key, "selection_frequency", "kw_above_base_window", "rank_by_kw", "cumulative_share_without_exception",
+    cols = [key, "selection_frequency", "value_kw", "rank_by_kw", "cumulative_share_without_exception",
             "cumulative_share_with_exception", "composite_rank", "rank_difference", "freq_rank", "pv_text",
             "tightest_margin", "status", "winter_coverage"]
     notes = out[["kw_na_reason", "cumulative_share_note", "composite_note"]].apply(
@@ -538,7 +539,7 @@ def main(cfg=CONFIG, rerun=False):
                   decimal=cfg["csv_decimal"], index=False, encoding="utf-8-sig")
     # charts
     q1 = chart_robustness_value(cfg, t, names, cfg["output_dir"], log=(cfg["y_scale"] == "log"))
-    ratio = t["kw_above_base_window"].max() / max(t["kw_above_base_window"].median(), 1e-9)
+    ratio = t["value_kw"].max() / max(t["value_kw"].median(), 1e-9)
     if cfg["also_log_version"] and cfg["y_scale"] != "log" and ratio > cfg["log_if_ratio_over"]:
         chart_robustness_value(cfg, t, names, cfg["output_dir"], log=True, stem="robustness_vs_value_log")
     made2 = chart_composite_vs_freq(cfg, t, names, cfg["output_dir"]) if composite is not None else False
@@ -553,13 +554,13 @@ def main(cfg=CONFIG, rerun=False):
     sep = ("separates poorly: most sites sit near the top" if near / max(n, 1) > 0.5 else
            "separates reasonably: most sites are not at the top" if mid >= 0.25 * n else
            "mostly sites at the extremes (near 100 % or near 0 %)")
-    fin = t[t["status"].isin(["final", "exception"])].dropna(subset=["selection_frequency", "kw_above_base_window"])
+    fin = t[t["status"].isin(["final", "exception"])].dropna(subset=["selection_frequency", "value_kw"])
     quad = {}
     for _, r in fin.iterrows():
-        quad.setdefault(quadrant(cfg, r["selection_frequency"], r["kw_above_base_window"], q1["y_all"] if q1 else 0),
+        quad.setdefault(quadrant(cfg, r["selection_frequency"], r["value_kw"], q1["y_all"] if q1 else 0),
                         []).append(names[r[key]] + ("*" if r["status"] == "exception" else ""))
     doubts = []
-    na_kw = t[t["kw_above_base_window"].isna()][key].map(names).tolist()
+    na_kw = t[t["value_kw"].isna()][key].map(names).tolist()
     if na_kw:
         doubts.append(f"kW missing: {', '.join(na_kw)}")
     cov = t[t["winter_coverage"] < 0.8][key].map(names).tolist()

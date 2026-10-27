@@ -48,7 +48,7 @@ CONFIG = {
     "output_dir": "filter_sensitivity_out",
     "site_key": "site_id",
     # The screening script whose SELECTION is the baseline (in this folder).
-    "lpc_module": "lpc_10",
+    "lpc_module": "lpc_11",
     # True: baseline, upper bounds, decimals, rank_by, trim and exceptions
     # are taken from lpc_10's SELECTION (the values below are overwritten).
     "baseline_from_lpc": True,
@@ -74,7 +74,7 @@ CONFIG = {
     "missing_value_fails": True,
 
     # What the cumulative share is computed on (lpc_10's rank_by).
-    "share_by": "window_above_base_winter_kw",
+    "share_by": "median_above_base_year_kw",   # replaced by SELECTION["rank_by"] of the lpc module
 
     # Baseline tail trim: the rule that reproduces the current final group.
     #   {"rule": "n_smallest", "n": 3}          the n smallest contributors
@@ -669,6 +669,7 @@ def main(cfg=CONFIG, skip_check=False):
                                    for k in freq[key]]
     freq = freq.sort_values(["selection_frequency", key], ascending=[False, True], kind="mergesort")
     write(freq, "filter_factorial_selection_frequency.csv", cfg)
+    write(freq, "selection_frequency.csv", cfg)          # revised plan's name for the same table
 
     # ---- C
     marg = margins(t, cfg)
