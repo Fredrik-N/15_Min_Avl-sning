@@ -1,0 +1,12 @@
+subscription_value.py -- header of this run
+series: area substation load (PROXY) (proxy); file screening_out\substation_proxy_hourly.csv; year 2025
+hours of the series: 8760; negative values (feed-in) clipped to 0: 0 hours (per month: Jan 0, Feb 0, Mar 0, Apr 0, May 0, Jun 0, Jul 0, Aug 0, Sep 0, Oct 0, Nov 0, Dec 0)
+pool: offerable_flex_out\pool_levels.csv; source 15 min; f = 0.5; level P10 (firm_P10_kw); block lengths [1, 2, 4] h; sites in the pool: 8
+prices: p_sub = 40 SEK/kW and month; overrun factor 2 (= 80 SEK per kW of excess); level per month; withdrawal only
+excess e: [100, 250, 500, 1000] kW (A1, same in every month); level S_m = P_m - e (A2); perfect foresight (A3)
+forecast-margin sensitivity: the pool is called in hours above S_m - margin and cuts them to that level (interpretation of 'also call in'); margin = share of the monthly peak
+flexibility price: not estimated (A6); break-even price = avoided overrun / energy cut; reference prices {'availability_low': 200.0, 'availability_high': 1000.0, 'activation_average_2024_25': 3300.0, 'pessimistic': 10000.0}
+rebound (A7): off
+offer lookup: block length min(L, 4) h, smallest available block >= that; missing slice = 0 kW offered
+months without data: []
+checks: all checks passed: E_m(e) non-decreasing in e; d <= e; value = 0 when d = 0; annual sum = sum of months
