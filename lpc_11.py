@@ -443,6 +443,7 @@ CONFIG = {
         "percentile": 5,                 # L_base(season) = P5 of the 15-min load in that season
         "exclude_export_quarters": True, # leave quarter-hours with net < 0 out (PV export)
         "min_quarter_hours": 960,        # fewer usable quarter-hours in a season -> no base (N/A)
+        "min_quarter_hours_month": 480,  # same for a calendar month (about 5 days); used by period "month"
     },
     "hour_min_quarters": 4,              # an hour counts only with all 4 quarter-hours present
     "screening_out_dir": "screening_out",
@@ -2162,6 +2163,45 @@ def seasonal_base_load(power, cfg):
                      f"P{bl.get('percentile', 5)} of {len(s)} quarter-hours"
                      + (f", {n_exp} exporting left out" if n_exp else ""))
     return out
+
+
+def monthly_base_load(power, cfg):
+    """{month 1..12: (L_base kW or None, text)}. Same definition as
+    seasonal_base_load (P<percentile>, exporting quarter-hours left out) but
+    over one calendar month, pooled over the years in the file. Needs
+    base_load["min_quarter_hours_month"] usable quarter-hours (default 480)."""
+    bl = cfg.get("base_load") or {}
+    pct = bl.get("percentile", 5) / 100
+    need = bl.get("min_quarter_hours_month", 480)
+    out = {}
+    v = power.dropna()
+    for m in range(1, 13):
+        s = v[v.index.month == m]
+        n_exp = int((s < 0).sum())
+        if bl.get("exclude_export_quarters", True):
+            s = s[s >= 0]
+        if len(s) < need:
+            out[m] = (None, f"only {len(s)} usable quarter-hours in month {m}")
+            continue
+        out[m] = (float(s.quantile(pct)),
+                  f"P{bl.get('percentile', 5)} of {len(s)} quarter-hours"
+                  + (f", {n_exp} exporting left out" if n_exp else ""))
+    return out
+
+
+def hourly_base_load(power, h, cfg, period="season"):
+    """L_base for every hour in the hourly series h (index = hour start).
+    period "season": one level per season (seasonal_base_load, the default);
+    "month": one level per calendar month (monthly_base_load). Hours whose
+    period has too little data get NaN. Returns a float Series aligned to h."""
+    if period == "month":
+        base = monthly_base_load(power, cfg)
+        return pd.Series([base[m][0] for m in h.index.month], index=h.index, dtype=float)
+    if period != "season":
+        raise ValueError(f"base period must be 'season' or 'month', not {period!r}")
+    base = seasonal_base_load(power, cfg)
+    som = season_of_month(cfg)
+    return pd.Series([base.get(som.get(m), (None,))[0] for m in h.index.month], index=h.index, dtype=float)
 
 
 def hourly_mean(power, cfg):

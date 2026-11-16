@@ -5,15 +5,20 @@ the revised plan).
   1 s    P_1s(s,h) = sum_k c_k * P_rated,k * units_k * a_k(h)
          c_k = controllable (compressor_list.csv), a_k(h) = running share
          (compressor_hourly.csv), both from `unilm_fhmm.py METER --out DIR`.
-  15 min P_15(s,h) = f * max(0, mean 15-min load in h - L_base(s, season))
+  15 min P_15(s,h) = f * max(0, mean 15-min load in h - L_base(s, period))
          for every f in CONFIG["f_values"]. L_base = P5 of the site's 15-min
-         load in the same season, exporting quarter-hours left out -- the
-         SAME function as lpc_11 (seasonal_base_load), not a copy. The load is
-         the GROSS load where lpc_11 finds a generation file, else the net.
+         load in the same period, exporting quarter-hours left out -- the
+         SAME functions as lpc_11 (seasonal_base_load / monthly_base_load),
+         not copies. CONFIG["base_period"] = "season" (default, one level per
+         season) or "month" (one level per calendar month, follows the drift
+         of the base load with the weather). The load is the GROSS load where
+         lpc_11 finds a generation file, else the net.
 
 Output: reducible_power.csv with site, hour, source, f, kW plus season,
 series (net / gross / 1 s compressors), base load, block length (1 h) and
-percentile (none: hourly values). Site codes only: the private key is read
+percentile (none: hourly values). base_period_compare.csv puts the two
+base-load definitions side by side per site, month and f (base level, mean
+reducible power, hours) whichever one is chosen. Site codes only: the private key is read
 here to turn site ids into codes and never written.
 
 Run:  python reducible_power.py     (lpc_11.py in the same folder)
@@ -30,6 +35,7 @@ CONFIG = {
     "include_negative_controls": False,
     "exclude_sites": [],              # site ids (as in site_comparison.csv) or codes to leave out, e.g. ["H"]
     "f_values": [0.3, 0.5, 0.7, 1.0],
+    "base_period": "season",          # "season" | "month": period of the base load L_base (15-min sites)
     # 1 s sites: {site code: unilm_fhmm output folder}
     "one_second_sites": {},
     "output_dir": "reducible_power_out",
@@ -51,25 +57,39 @@ def season_name(month, lcfg):
     return None
 
 
-def p15_site(L, lcfg, path, code, f_values):
-    """Hourly P_15 for one meter file, every f. Returns a long DataFrame."""
+def p15_site(L, lcfg, path, code, f_values, base_period="season"):
+    """Hourly P_15 for one meter file, every f. Returns (long DataFrame with the
+    chosen base period, comparison DataFrame season vs month per calendar month)."""
     c = dict(lcfg, csv_path=path, show_plot=False)
     net, info = L.load_net_series(c)
     gross = L.gross_series(net, c)
     load, series = (gross, "gross (net + generation)") if gross is not None else \
         (net, "net exchange" + (" -- PV site without production data" if info.get("pv_flag") else ""))
-    base = L.seasonal_base_load(load, c)
     h = L.hourly_mean(load, c)
     seas = pd.Series([season_name(m, lcfg) for m in h.index.month], index=h.index)
-    b = seas.map({k: v[0] for k, v in base.items()}).astype(float)
+    b_s = L.hourly_base_load(load, h, c, "season")
+    b_m = L.hourly_base_load(load, h, c, "month")
+    b = b_m if base_period == "month" else b_s
     above = (h - b).clip(lower=0)
-    rows = []
+    rows, comp = [], []
     for f in f_values:
         rows.append(pd.DataFrame({"site": code, "hour": h.index.strftime("%Y-%m-%d %H:00"), "source": "15 min",
                                   "f": f, "kW": np.round(f * above.to_numpy(), 3), "season": seas.to_numpy(),
-                                  "series": series, "base_load_kw": np.round(b.to_numpy(), 2)}))
+                                  "series": series, "base_load_kw": np.round(b.to_numpy(), 2),
+                                  "base_period": base_period}))
+        a_s = f * (h - b_s).clip(lower=0)
+        a_m = f * (h - b_m).clip(lower=0)
+        ok = a_s.notna() & a_m.notna()            # same hours for both, so the two columns compare like with like
+        g = pd.DataFrame({"base_season_kw": b_s[ok], "base_month_kw": b_m[ok], "kW_season_base": a_s[ok],
+                          "kW_month_base": a_m[ok]}).groupby(h.index[ok].month)
+        t = g.mean().round(2)
+        t["hours"] = g.size()
+        t.insert(0, "f", f)
+        t.insert(0, "month", t.index)
+        t.insert(0, "site", code)
+        comp.append(t.reset_index(drop=True))
     out = pd.concat(rows, ignore_index=True)
-    return out[out["kW"].notna()]
+    return out[out["kW"].notna()], pd.concat(comp, ignore_index=True)
 
 
 def p1s_site(code, folder):
@@ -102,7 +122,9 @@ def main(cfg=CONFIG):
     codes = L._code_map(lcfg)
     if not codes:
         print("[reducible] WARNING: lpc CONFIG['site_code_key'] not set -- outputs hold REAL site ids")
-    parts, status = [], []
+    if cfg["base_period"] not in ("season", "month"):
+        raise SystemExit(f"[reducible] CONFIG base_period must be 'season' or 'month', not {cfg['base_period']!r}")
+    parts, status, comps = [], [], []
     df = L.read_comparison(lcfg)
     if df is not None and cfg["sites_15min"]:
         if cfg["sites_15min"] == "selected":
@@ -126,7 +148,9 @@ def main(cfg=CONFIG):
                 status.append((code, "15 min", "meter file not found"))
                 continue
             try:
-                parts.append(p15_site(L, lcfg, path, code, cfg["f_values"]))
+                o, cmp_ = p15_site(L, lcfg, path, code, cfg["f_values"], cfg["base_period"])
+                parts.append(o)
+                comps.append(cmp_)
                 status.append((code, "15 min", "ok"))
             except Exception as e:                      # one bad file must not stop the rest
                 status.append((code, "15 min", f"{type(e).__name__}: {e}"))
@@ -147,6 +171,20 @@ def main(cfg=CONFIG):
     out["percentile"] = "none (hourly value)"
     path = os.path.join(cfg["output_dir"], "reducible_power.csv")
     out.to_csv(path, sep=cfg["csv_sep"], decimal=cfg["csv_decimal"], index=False, encoding="utf-8-sig")
+    if comps:
+        cp = pd.concat(comps, ignore_index=True)
+        cp.to_csv(os.path.join(cfg["output_dir"], "base_period_compare.csv"), sep=cfg["csv_sep"],
+                  decimal=cfg["csv_decimal"], index=False, encoding="utf-8-sig")
+        print(f"[reducible] base period used: {cfg['base_period']}")
+        f0 = 0.5 if 0.5 in cfg["f_values"] else cfg["f_values"][0]
+        c0 = cp[np.isclose(cp["f"], f0)].copy()
+        for col in ("kW_season_base", "kW_month_base"):
+            c0[col] = c0[col] * c0["hours"]
+        g = c0.groupby("month")[["kW_season_base", "kW_month_base", "hours"]].sum()
+        g["kW_season_base"] = (g["kW_season_base"] / g["hours"]).round(1)
+        g["kW_month_base"] = (g["kW_month_base"] / g["hours"]).round(1)
+        print(f"[reducible] mean reducible power per hour, all 15-min sites, f = {f0} (hours-weighted):")
+        print(g.rename(columns={"kW_season_base": "season base", "kW_month_base": "month base"}).to_string())
     st = pd.DataFrame(status, columns=["site", "source", "status"])
     st.to_csv(os.path.join(cfg["output_dir"], "reducible_power_status.csv"), sep=cfg["csv_sep"], index=False,
               encoding="utf-8-sig")
