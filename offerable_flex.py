@@ -22,7 +22,9 @@ has no f; it enters every f run with the same values.
    the number of sites needed for a firm 0.1 MW when sites are added in order
    of their firm level.
 Outputs: offer_levels.csv, offer_classification.csv, pool_levels.csv,
-pool_sites_needed.csv, pool_hourly.csv (for figures.py). Every row records
+pool_sites_needed.csv, pool_hourly.csv (for figures.py), pool_monthly.csv and
+site_monthly.csv (per calendar month over all hours: typical P50, firm P10,
+share of hours >= 0.1 MW). Every row records
 source resolution, season, block length, percentile and f.
 """
 import os
@@ -112,6 +114,17 @@ def main(cfg=CONFIG):
     fs = cfg["f_values"] or sorted(d.loc[d["source"] == "15 min", "f"].dropna().astype(float).unique()) or [1.0]
     pf = cfg["levels"]["firm"] / 100
     lv_rows, cl_rows, pool_rows, need_rows, pool_hourly = [], [], [], [], []
+    pool_month, site_month = [], []
+
+    def month_rows(x, extra):
+        out = []
+        x = x.dropna()
+        for m, v in x.groupby(x.index.month):
+            r = dict(extra, month=int(m), n_hours=len(v), mean_kw=v.mean(), typical_P50_kw=v.median(),
+                     firm_P10_kw=v.quantile(pf), share_hours_ge_0_1MW=(v >= cfg["lfm_min_kw"]).mean())
+            r["season"] = {m_: k for k, ms in cfg["seasons"].items() for m_ in ms}.get(int(m))
+            out.append(r)
+        return out
     for f in fs:
         ser = site_series(d, f)
         blocks = {}
@@ -120,6 +133,8 @@ def main(cfg=CONFIG):
             for L in cfg["blocks_h"]:
                 b = block_min(sdf["kW"], L)
                 blocks[(site, L)] = b
+                site_month += month_rows(b, {"site": site, "f": f if not sdf["is_1s"].all() else np.nan,
+                                             "block_h": L, "source": src})
                 t = levels_table(b, sdf["is_1s"], cfg)
                 t.insert(0, "site", site)
                 t.insert(1, "f", f if not sdf["is_1s"].all() else np.nan)
@@ -160,6 +175,8 @@ def main(cfg=CONFIG):
             ph = pd.DataFrame({"hour": pool.index, "f": f, "block_h": L, "pool_kw": pool.to_numpy(),
                                "n_sites": len(sites)})
             pool_hourly.append(ph)
+            pool_month += month_rows(pool, {"f": f, "block_h": L, "n_sites": len(sites),
+                                            "sites": " ".join(map(str, sites))})
             # sites needed: add in order of the site's firm level (year)
             firm_site = {s: blocks[(s, L)].dropna().quantile(pf) for s in sites}
             order = sorted(sites, key=lambda s: -np.nan_to_num(firm_site[s], nan=-1))
@@ -199,6 +216,11 @@ def main(cfg=CONFIG):
     cl = wr(cl_rows, "offer_classification.csv")
     wr(pool_rows, "pool_levels.csv")
     nd = wr(need_rows, "pool_sites_needed.csv")
+    pm = wr(pool_month, "pool_monthly.csv")
+    wr(site_month, "site_monthly.csv")
+    if pm is not None:
+        print(pm[pm["block_h"] == min(cfg["blocks_h"])].pivot_table(index="month", columns="f", values="firm_P10_kw")
+              .round(1).to_string())
     if pool_hourly:
         pd.concat(pool_hourly, ignore_index=True).round(3).to_csv(
             os.path.join(cfg["output_dir"], "pool_hourly.csv"), **w)

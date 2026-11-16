@@ -28,6 +28,7 @@ CONFIG = {
     "lpc_module": "lpc_11",
     "sites_15min": "selected",        # "selected" | "all" | [site ids as in site_comparison.csv]
     "include_negative_controls": False,
+    "exclude_sites": [],              # site ids (as in site_comparison.csv) or codes to leave out, e.g. ["H"]
     "f_values": [0.3, 0.5, 0.7, 1.0],
     # 1 s sites: {site code: unilm_fhmm output folder}
     "one_second_sites": {},
@@ -113,9 +114,13 @@ def main(cfg=CONFIG):
             pick = df[df[L.SITE_KEY].astype(str).str.strip().str.lower().isin(want)]
         if not cfg["include_negative_controls"] and "is_negative_control" in pick:
             pick = pick[~pick["is_negative_control"].astype(str).str.lower().isin(["true", "1", "1.0"])]
+        drop = {str(x).strip().lower() for x in cfg.get("exclude_sites") or []}
         for _, r in pick.iterrows():
             sid = str(r[L.SITE_KEY])
             code = codes.get(sid.strip().lower(), sid if not codes else f"UNCODED:{sid}")
+            if sid.strip().lower() in drop or str(code).strip().lower() in drop:
+                status.append((code, "15 min", "excluded (CONFIG exclude_sites)"))
+                continue
             path = L.find_meter_file(r, lcfg)
             if path is None:
                 status.append((code, "15 min", "meter file not found"))
